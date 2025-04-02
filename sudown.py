@@ -131,15 +131,15 @@ if __name__ == "__main__":
         description="Sudown - Sudo Misconfiguration Exploiter",
         epilog="""
 Examples:
-  ./sudown.py                   # Discover misconfigurations and print payloads
-  ./sudown.py --auto            # Auto-exploit all NOPASSWD targets
-  ./sudown.py --auto --first    # Only auto-exploit the first available target
-  ./sudown.py --auto --no-spawn # Evaluate and show payloads but don't spawn shells
+  ./sudown.py            # Discover misconfigurations and print payloads
+  ./sudown.py -a         # Auto-exploit all NOPASSWD targets
+  ./sudown.py -a -f      # Only auto-exploit the first available target
+  ./sudown.py -a -n      # Evaluate and show payloads but don't spawn shells
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--auto", action="store_true", help="Auto-execute detected exploits")
-    parser.add_argument("--first", action="store_true", help="Only auto-exploit the first target")
-    parser.add_argument("--no-spawn", action="store_true", help="Print exploits but skip execution")
+    parser.add_argument("-a", "--auto", action="store_true", help="Auto-execute detected exploits")
+    parser.add_argument("-f", "--first", action="store_true", help="Only auto-exploit the first target")
+    parser.add_argument("-n", "--no-spawn", action="store_true", help="Print exploits but skip execution")
     args = parser.parse_args()
     main(auto_execute=args.auto, first_only=args.first, no_spawn=args.no_spawn)
