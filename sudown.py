@@ -9,6 +9,8 @@ import argparse
 import getpass
 import shutil
 import sys
+import platform
+import pwd
 
 # GTFOBins lookup dictionary
 GTFOBINS = {
@@ -96,7 +98,15 @@ def spawn_shell(command):
     finally:
         os.system("stty sane")
 
+def system_info():
+    print("[+] System & User Info")
+    print(f"    Hostname   : {platform.node()}")
+    print(f"    OS         : {platform.system()} {platform.release()} ({platform.version()})")
+    print(f"    Architecture: {platform.machine()}")
+    print(f"    Current User: {pwd.getpwuid(os.geteuid()).pw_name} (UID: {os.geteuid()})\n")
+
 def sanity_checks():
+    system_info()
     print("[+] Performing environment checks...")
     for binary in ["sudo", "/bin/sh"]:
         if not shutil.which(binary):
@@ -105,7 +115,7 @@ def sanity_checks():
     if not sys.stdin.isatty():
         print("[-] Not running in an interactive terminal — may break password prompt or TTY shell.")
         sys.exit(1)
-    print("[+] Environment looks good!")
+    print("[+] Environment looks good!\n")
 
 def main(auto_execute=False, first_only=False, no_spawn=False):
     sanity_checks()
